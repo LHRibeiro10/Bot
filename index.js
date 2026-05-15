@@ -1,13 +1,72 @@
 require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const REQUIRED_ENVS = ["BOT_TOKEN", "TARGET_CHAT"];
 
-const TARGET_CHAT = process.env.TARGET_CHAT;
-const ADMIN_ID = Number(process.env.ADMIN_ID);
+function readRequiredEnv(name) {
+  const value = process.env[name];
+
+  if (!value || !value.trim()) {
+    throw new Error(`Variável obrigatória ausente no .env: ${name}`);
+  }
+
+  return value.trim();
+}
+
+function parseAdminIds() {
+  const rawAdmins = process.env.ADMIN_IDS || process.env.ADMIN_ID;
+
+  if (!rawAdmins || !rawAdmins.trim()) {
+    throw new Error("Configure ADMIN_ID ou ADMIN_IDS no .env.");
+  }
+
+  const ids = rawAdmins
+    .split(",")
+    .map((id) => Number(id.trim()))
+    .filter((id) => Number.isSafeInteger(id) && id > 0);
+
+  if (!ids.length) {
+    throw new Error("ADMIN_ID/ADMIN_IDS inválido. Use IDs numéricos do Telegram.");
+  }
+
+  return new Set(ids);
+}
+
+for (const envName of REQUIRED_ENVS) {
+  readRequiredEnv(envName);
+}
+
+const BOT_TOKEN = readRequiredEnv("BOT_TOKEN");
+const TARGET_CHAT = readRequiredEnv("TARGET_CHAT");
+const ADMIN_IDS = parseAdminIds();
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+function logInfo(message, data = {}) {
+  console.log(
+    JSON.stringify({
+      level: "info",
+      at: new Date().toISOString(),
+      message,
+      ...data,
+    })
+  );
+}
+
+function logError(message, error, data = {}) {
+  console.error(
+    JSON.stringify({
+      level: "error",
+      at: new Date().toISOString(),
+      message,
+      error: error?.message || String(error),
+      ...data,
+    })
+  );
+}
 
 function isAdmin(msg) {
-  return !ADMIN_ID || msg.from.id === ADMIN_ID;
+  return ADMIN_IDS.has(msg.from.id);
 }
 
 function escapeHtml(text = "") {
@@ -21,7 +80,69 @@ function getOrdinalEntrada(numero) {
   return `${numero}ª`;
 }
 
-bot.onText(/\/start/, (msg) => {
+function parseFields(text, expectedCount) {
+  return text
+    .split("|")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .slice(0, expectedCount);
+}
+
+function isValidUrl(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return ["http:", "https:"].includes(parsedUrl.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function commandContext(msg, command) {
+  return {
+    command,
+    userId: msg.from?.id,
+    username: msg.from?.username,
+    chatId: msg.chat?.id,
+  };
+}
+
+async function denyIfNotAdmin(msg, action) {
+  if (isAdmin(msg)) {
+    return false;
+  }
+
+  logInfo("Comando bloqueado por falta de permissão", commandContext(msg, action));
+  await bot.sendMessage(msg.chat.id, "Você não tem permissão para usar este comando.");
+  return true;
+}
+
+async function sendTargetMessage(msg, command, sendFn) {
+  try {
+    await sendFn();
+    logInfo("Postagem enviada", commandContext(msg, command));
+    await bot.sendMessage(msg.chat.id, "Postagem enviada ✅");
+  } catch (error) {
+    logError("Erro ao enviar postagem", error, commandContext(msg, command));
+    await bot.sendMessage(
+      msg.chat.id,
+      "Deu erro ao postar. Confira o terminal e as permissões do bot no canal/grupo."
+    );
+  }
+}
+
+async function validateLinkOrReply(msg, link) {
+  if (isValidUrl(link)) {
+    return true;
+  }
+
+  await bot.sendMessage(
+    msg.chat.id,
+    "Link inválido. Use uma URL começando com http:// ou https://."
+  );
+  return false;
+}
+
+bot.onText(/\/start|\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
     `Bot BadBoys Tips ativo ✅
@@ -29,6 +150,7 @@ bot.onText(/\/start/, (msg) => {
 Comandos:
 /id - ver seu ID
 /chatid - ver ID deste grupo/canal
+/status - ver se o bot está configurado
 /teste - testar envio
 
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
@@ -37,16 +159,8 @@ Comandos:
 /greenfoto NÚMERO | VALOR_ENTRADA | RETORNO | RESULTADO
 /red PREJUÍZO
 
-Para usar /entradafoto:
-Envie uma FOTO com a legenda:
-/entradafoto 1 | R$100 | R$150 | https://google.com
-
-Para usar /greenfoto:
-Envie uma FOTO com a legenda:
-/greenfoto 1 | R$100 | R$150 | +R$50
-
-Para usar /red:
-/red -R$100`
+Exemplo:
+/entrada COPA DO BRASIL | Corinthians x Barra FC | Mais de 0.5 gol no 1º tempo | 1.73 | 1 unidade | https://google.com`
   );
 });
 
@@ -58,47 +172,56 @@ bot.onText(/\/chatid/, (msg) => {
   bot.sendMessage(msg.chat.id, `ID deste chat é: ${msg.chat.id}`);
 });
 
-bot.onText(/\/teste/, async (msg) => {
-  try {
-    if (!isAdmin(msg)) {
-      return bot.sendMessage(msg.chat.id, "Você não tem permissão.");
-    }
-
-    await bot.sendMessage(TARGET_CHAT, "Teste de postagem do bot ✅");
-    bot.sendMessage(msg.chat.id, "Mensagem de teste enviada ✅");
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(msg.chat.id, "Erro ao enviar teste. Veja o terminal.");
+bot.onText(/\/status/, async (msg) => {
+  if (await denyIfNotAdmin(msg, "status")) {
+    return;
   }
+
+  bot.sendMessage(
+    msg.chat.id,
+    `Bot online ✅
+Chat alvo: ${TARGET_CHAT}
+Admins configurados: ${ADMIN_IDS.size}`
+  );
+});
+
+bot.onText(/\/teste/, async (msg) => {
+  if (await denyIfNotAdmin(msg, "teste")) {
+    return;
+  }
+
+  await sendTargetMessage(msg, "teste", () =>
+    bot.sendMessage(TARGET_CHAT, "Teste de postagem do bot ✅")
+  );
 });
 
 bot.onText(/\/entrada (.+)/, async (msg, match) => {
-  try {
-    if (!isAdmin(msg)) {
-      return bot.sendMessage(
-        msg.chat.id,
-        "Você não tem permissão para postar entradas."
-      );
-    }
+  if (await denyIfNotAdmin(msg, "entrada")) {
+    return;
+  }
 
-    const partes = match[1].split("|").map((p) => p.trim());
+  const partes = parseFields(match[1], 6);
 
-    if (partes.length < 6) {
-      return bot.sendMessage(
-        msg.chat.id,
-        `Formato inválido.
+  if (partes.length < 6) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `Formato inválido.
 
 Use assim:
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
 
 Exemplo:
 /entrada COPA DO BRASIL | Corinthians x Barra FC | Mais de 0.5 gol no 1º tempo + Corinthians vence | 1.73 | 1 unidade | https://google.com`
-      );
-    }
+    );
+  }
 
-    const [campeonato, jogo, mercado, odd, unidade, link] = partes;
+  const [campeonato, jogo, mercado, odd, unidade, link] = partes;
 
-    const mensagem = `
+  if (!(await validateLinkOrReply(msg, link))) {
+    return;
+  }
+
+  const mensagem = `
 🟢 <b>Pré-Live FREE 🆓</b>
 
 🏆 <b>${escapeHtml(campeonato)}</b>
@@ -117,7 +240,8 @@ Exemplo:
 +18 | Aposte com responsabilidade. Sem lucro garantido.
 `;
 
-    await bot.sendMessage(TARGET_CHAT, mensagem, {
+  await sendTargetMessage(msg, "entrada", () =>
+    bot.sendMessage(TARGET_CHAT, mensagem, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: {
@@ -130,41 +254,30 @@ Exemplo:
           ],
         ],
       },
-    });
-
-    bot.sendMessage(msg.chat.id, "Entrada postada ✅");
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(
-      msg.chat.id,
-      "Deu erro ao postar a entrada. Veja o terminal."
-    );
-  }
+    })
+  );
 });
 
 bot.on("photo", async (msg) => {
-  try {
-    if (!isAdmin(msg)) {
+  if (await denyIfNotAdmin(msg, "photo")) {
+    return;
+  }
+
+  const caption = msg.caption || "";
+  const foto = msg.photo?.[msg.photo.length - 1]?.file_id;
+
+  if (!foto) {
+    return bot.sendMessage(msg.chat.id, "Não consegui identificar a foto enviada.");
+  }
+
+  if (caption.startsWith("/entradafoto")) {
+    const conteudo = caption.replace("/entradafoto", "").trim();
+    const partes = parseFields(conteudo, 4);
+
+    if (partes.length < 4) {
       return bot.sendMessage(
         msg.chat.id,
-        "Você não tem permissão para postar imagens."
-      );
-    }
-
-    const caption = msg.caption || "";
-    const foto = msg.photo[msg.photo.length - 1].file_id;
-
-    // =========================
-    // ENTRADA COM FOTO
-    // =========================
-    if (caption.startsWith("/entradafoto")) {
-      const conteudo = caption.replace("/entradafoto", "").trim();
-      const partes = conteudo.split("|").map((p) => p.trim());
-
-      if (partes.length < 4) {
-        return bot.sendMessage(
-          msg.chat.id,
-          `Formato inválido.
+        `Formato inválido.
 
 Envie a FOTO do bilhete com esta legenda:
 
@@ -172,19 +285,23 @@ Envie a FOTO do bilhete com esta legenda:
 
 Exemplo:
 /entradafoto 1 | R$100 | R$150 | https://google.com`
-        );
-      }
+      );
+    }
 
-      const [numeroEntrada, valorEntrada, retorno, link] = partes;
+    const [numeroEntrada, valorEntrada, retorno, link] = partes;
 
-      const numero = escapeHtml(numeroEntrada);
-      const valor = escapeHtml(valorEntrada);
-      const ganho = escapeHtml(retorno);
+    if (!(await validateLinkOrReply(msg, link))) {
+      return;
+    }
 
-      const legenda = `
+    const numero = escapeHtml(numeroEntrada);
+    const valor = escapeHtml(valorEntrada);
+    const ganho = escapeHtml(retorno);
+
+    const legenda = `
 ⭐ <b>${getOrdinalEntrada(numero)} Entrada Projeto 1K 📊</b>
 
-${getOrdinalEntrada(numero)} <b>${valor} —> ${ganho}</b> 🚀🚀
+${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
 
 <b>Dos ${valor} aos ${ganho}</b> 📈
 
@@ -193,7 +310,8 @@ ${getOrdinalEntrada(numero)} <b>${valor} —> ${ganho}</b> 🚀🚀
 <i>+18 aposte com responsabilidade!</i>
 `;
 
-      await bot.sendPhoto(TARGET_CHAT, foto, {
+    return sendTargetMessage(msg, "entradafoto", () =>
+      bot.sendPhoto(TARGET_CHAT, foto, {
         caption: legenda,
         parse_mode: "HTML",
         reply_markup: {
@@ -206,22 +324,18 @@ ${getOrdinalEntrada(numero)} <b>${valor} —> ${ganho}</b> 🚀🚀
             ],
           ],
         },
-      });
+      })
+    );
+  }
 
-      return bot.sendMessage(msg.chat.id, "Entrada com foto postada ✅");
-    }
+  if (caption.startsWith("/greenfoto")) {
+    const conteudo = caption.replace("/greenfoto", "").trim();
+    const partes = parseFields(conteudo, 4);
 
-    // =========================
-    // GREEN COM FOTO
-    // =========================
-    if (caption.startsWith("/greenfoto")) {
-      const conteudo = caption.replace("/greenfoto", "").trim();
-      const partes = conteudo.split("|").map((p) => p.trim());
-
-      if (partes.length < 4) {
-        return bot.sendMessage(
-          msg.chat.id,
-          `Formato inválido.
+    if (partes.length < 4) {
+      return bot.sendMessage(
+        msg.chat.id,
+        `Formato inválido.
 
 Envie a FOTO do green com esta legenda:
 
@@ -229,22 +343,21 @@ Envie a FOTO do green com esta legenda:
 
 Exemplo:
 /greenfoto 1 | R$100 | R$150 | +R$50`
-        );
-      }
+      );
+    }
 
-      const [numeroEntrada, valorEntrada, retorno, resultado] = partes;
+    const [numeroEntrada, valorEntrada, retorno, resultado] = partes;
+    const numero = escapeHtml(numeroEntrada);
+    const valor = escapeHtml(valorEntrada);
+    const ganho = escapeHtml(retorno);
+    const lucro = escapeHtml(resultado);
 
-      const numero = escapeHtml(numeroEntrada);
-      const valor = escapeHtml(valorEntrada);
-      const ganho = escapeHtml(retorno);
-      const lucro = escapeHtml(resultado);
-
-      const legenda = `
+    const legenda = `
 ✅✅✅ <b>GREEN CONFIRMADO!</b> ✅✅✅
 
 ⭐ <b>${getOrdinalEntrada(numero)} Entrada Projeto 1K 📊</b>
 
-${getOrdinalEntrada(numero)} <b>${valor} —> ${ganho}</b> 🚀🚀
+${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
 
 📈 <b>Resultado:</b> ${lucro}
 
@@ -255,49 +368,43 @@ ${getOrdinalEntrada(numero)} <b>${valor} —> ${ganho}</b> 🚀🚀
 <i>+18 aposte com responsabilidade!</i>
 `;
 
-      await bot.sendPhoto(TARGET_CHAT, foto, {
+    return sendTargetMessage(msg, "greenfoto", () =>
+      bot.sendPhoto(TARGET_CHAT, foto, {
         caption: legenda,
         parse_mode: "HTML",
-      });
-
-      return bot.sendMessage(msg.chat.id, "Green com foto postado ✅");
-    }
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(
-      msg.chat.id,
-      "Deu erro ao postar a imagem. Veja o terminal."
+      })
     );
   }
+
+  return bot.sendMessage(
+    msg.chat.id,
+    "Foto recebida. Para postar, use a legenda /entradafoto ou /greenfoto."
+  );
 });
 
 bot.onText(/\/green (.+)/, async (msg, match) => {
-  try {
-    if (!isAdmin(msg)) {
-      return bot.sendMessage(
-        msg.chat.id,
-        "Você não tem permissão para postar resultado."
-      );
-    }
+  if (await denyIfNotAdmin(msg, "green")) {
+    return;
+  }
 
-    const partes = match[1].split("|").map((p) => p.trim());
+  const partes = parseFields(match[1], 3);
 
-    if (partes.length < 3) {
-      return bot.sendMessage(
-        msg.chat.id,
-        `Formato inválido.
+  if (partes.length < 3) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `Formato inválido.
 
 Use assim:
 /green JOGO | ODD | RETORNO
 
 Exemplo:
 /green Corinthians x Barra FC | 1.73 | +0.73 unidade`
-      );
-    }
+    );
+  }
 
-    const [jogo, odd, retorno] = partes;
+  const [jogo, odd, retorno] = partes;
 
-    const mensagem = `
+  const mensagem = `
 ✅✅✅ <b>GREEN CONFIRMADO!</b> ✅✅✅
 
 ⚽ <b>Jogo:</b> ${escapeHtml(jogo)}
@@ -311,46 +418,35 @@ Exemplo:
 +18 | Aposte com responsabilidade. Sem lucro garantido.
 `;
 
-    await bot.sendMessage(TARGET_CHAT, mensagem, {
+  await sendTargetMessage(msg, "green", () =>
+    bot.sendMessage(TARGET_CHAT, mensagem, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
-    });
-
-    bot.sendMessage(msg.chat.id, "Green postado ✅");
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(
-      msg.chat.id,
-      "Deu erro ao postar o green. Veja o terminal."
-    );
-  }
+    })
+  );
 });
 
 bot.onText(/\/red (.+)/, async (msg, match) => {
-  try {
-    if (!isAdmin(msg)) {
-      return bot.sendMessage(
-        msg.chat.id,
-        "Você não tem permissão para postar resultado."
-      );
-    }
+  if (await denyIfNotAdmin(msg, "red")) {
+    return;
+  }
 
-    const prejuizo = match[1].trim();
+  const prejuizo = match[1].trim();
 
-    if (!prejuizo) {
-      return bot.sendMessage(
-        msg.chat.id,
-        `Formato inválido.
+  if (!prejuizo) {
+    return bot.sendMessage(
+      msg.chat.id,
+      `Formato inválido.
 
 Use assim:
 /red PREJUÍZO
 
 Exemplo:
 /red -R$100`
-      );
-    }
+    );
+  }
 
-    const mensagem = `
+  const mensagem = `
 ❌ <b>RED NA ENTRADA</b>
 
 📉 <b>Prejuízo:</b> ${escapeHtml(prejuizo)}
@@ -362,19 +458,32 @@ Exemplo:
 +18 | Aposte com responsabilidade. Sem lucro garantido.
 `;
 
-    await bot.sendMessage(TARGET_CHAT, mensagem, {
+  await sendTargetMessage(msg, "red", () =>
+    bot.sendMessage(TARGET_CHAT, mensagem, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
-    });
-
-    bot.sendMessage(msg.chat.id, "Red postado ✅");
-  } catch (error) {
-    console.error(error);
-    bot.sendMessage(
-      msg.chat.id,
-      "Deu erro ao postar o red. Veja o terminal."
-    );
-  }
+    })
+  );
 });
 
-console.log("Bot rodando...");
+bot.on("polling_error", (error) => {
+  logError("Erro no polling do Telegram", error);
+});
+
+bot.on("error", (error) => {
+  logError("Erro geral do Telegram Bot", error);
+});
+
+process.on("unhandledRejection", (error) => {
+  logError("Promise rejeitada sem tratamento", error);
+});
+
+process.on("uncaughtException", (error) => {
+  logError("Exceção não capturada", error);
+  process.exit(1);
+});
+
+logInfo("Bot rodando", {
+  targetChat: TARGET_CHAT,
+  adminCount: ADMIN_IDS.size,
+});
