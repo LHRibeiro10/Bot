@@ -1,7 +1,11 @@
 require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
 
 const REQUIRED_ENVS = ["BOT_TOKEN", "TARGET_CHAT"];
+const STATE_FILE = path.join(__dirname, "state.json");
+const BOT_TIME_ZONE = process.env.BOT_TIME_ZONE || "America/Sao_Paulo";
 
 function readRequiredEnv(name) {
   const value = process.env[name];
@@ -156,6 +160,422 @@ function calculateGreenResult(valorEntrada, retorno) {
   return formatCurrencyBRL(retornoCents - entradaCents, { signed: true });
 }
 
+function isCurrencyLike(value) {
+  return /r\$/i.test(String(value || "")) || String(value || "").includes("$");
+}
+
+function parseOdd(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw || isCurrencyLike(raw)) {
+    return null;
+  }
+
+  const normalized = raw.replace(",", ".").replace(/[^\d.]/g, "");
+  const odd = Number(normalized);
+
+  if (!Number.isFinite(odd) || odd <= 1 || odd > 50) {
+    return null;
+  }
+
+  return odd;
+}
+
+function formatOdd(odd) {
+  return String(odd).replace(".", ",");
+}
+
+function calculateReturnFromOdd(valueCents, odd) {
+  return Math.round(valueCents * odd);
+}
+
+function parseEntryNumber(value) {
+  const number = Number(String(value || "").trim());
+
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    return null;
+  }
+
+  return number;
+}
+
+function createInitialState() {
+  return {
+    version: 1,
+    nextEntryNumber: 1,
+    projectStartCents: null,
+    entries: [],
+    results: [],
+  };
+}
+
+function normalizeState(rawState = {}) {
+  const state = {
+    ...createInitialState(),
+    ...rawState,
+    entries: Array.isArray(rawState.entries) ? rawState.entries : [],
+    results: Array.isArray(rawState.results) ? rawState.results : [],
+  };
+
+  const highestEntryNumber = state.entries.reduce((highest, entry) => {
+    return Math.max(highest, Number(entry.number) || 0);
+  }, 0);
+
+  state.nextEntryNumber = Math.max(
+    Number(state.nextEntryNumber) || 1,
+    highestEntryNumber + 1
+  );
+
+  return state;
+}
+
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) {
+    return createInitialState();
+  }
+
+  try {
+    const rawState = fs.readFileSync(STATE_FILE, "utf8");
+    return normalizeState(JSON.parse(rawState));
+  } catch (error) {
+    const backupFile = `${STATE_FILE}.invalid-${Date.now()}`;
+    fs.copyFileSync(STATE_FILE, backupFile);
+    logError("state.json inválido; iniciando um estado novo", error, { backupFile });
+    return createInitialState();
+  }
+}
+
+function saveState() {
+  const tempFile = `${STATE_FILE}.tmp`;
+  fs.writeFileSync(tempFile, `${JSON.stringify(appState, null, 2)}\n`);
+  fs.renameSync(tempFile, STATE_FILE);
+}
+
+function makeId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getNextEntryNumber() {
+  return appState.nextEntryNumber;
+}
+
+function updateNextEntryNumber(number) {
+  appState.nextEntryNumber = Math.max(appState.nextEntryNumber, number + 1);
+}
+
+function ensureProjectStart(valueCents) {
+  if (appState.projectStartCents === null && Number.isSafeInteger(valueCents)) {
+    appState.projectStartCents = valueCents;
+  }
+}
+
+function registerPendingEntry(entry) {
+  ensureProjectStart(entry.valueCents);
+  updateNextEntryNumber(entry.number);
+  appState.entries.push(entry);
+}
+
+function findEntryByNumber(number) {
+  return appState.entries.find((entry) => entry.number === number);
+}
+
+function getLatestPendingEntry() {
+  return appState.entries
+    .filter((entry) => entry.status === "pending")
+    .sort((a, b) => b.number - a.number)[0];
+}
+
+function recordResult(result) {
+  appState.results.push({
+    id: makeId("result"),
+    createdAt: new Date().toISOString(),
+    ...result,
+  });
+}
+
+function closeEntry(entry, type, resultCents, source) {
+  entry.status = type;
+  entry.resultCents = resultCents;
+  entry.closedAt = new Date().toISOString();
+
+  recordResult({
+    type,
+    source,
+    entryId: entry.id,
+    number: entry.number,
+    valueCents: entry.valueCents,
+    returnCents: entry.returnCents,
+    resultCents,
+  });
+}
+
+function recordManualResult(type, resultCents, source, data = {}) {
+  recordResult({
+    type,
+    source,
+    resultCents,
+    ...data,
+  });
+}
+
+function buildEntradaFotoDraft(parts) {
+  const hasExplicitNumber = parts.length >= 4;
+  const number = hasExplicitNumber ? parseEntryNumber(parts[0]) : getNextEntryNumber();
+  const valueText = hasExplicitNumber ? parts[1] : parts[0];
+  const returnOrOddText = hasExplicitNumber ? parts[2] : parts[1];
+  const link = hasExplicitNumber ? parts[3] : parts[2];
+
+  if (!number) {
+    return { error: "Número da entrada inválido. Use um número inteiro, como 1, 2 ou 3." };
+  }
+
+  if (hasExplicitNumber && findEntryByNumber(number)) {
+    return { error: `A ${getOrdinalEntrada(number)} entrada já existe no histórico.` };
+  }
+
+  const valueCents = parseCurrencyCents(valueText);
+
+  if (valueCents === null || valueCents <= 0) {
+    return { error: "Valor de entrada inválido. Use algo como R$100 ou R$100,50." };
+  }
+
+  const odd = parseOdd(returnOrOddText);
+  const returnCents =
+    odd !== null
+      ? calculateReturnFromOdd(valueCents, odd)
+      : parseCurrencyCents(returnOrOddText);
+
+  if (returnCents === null || returnCents <= 0) {
+    return {
+      error:
+        "Não consegui entender o RETORNO/ODD. Use uma odd como 1.50 ou um retorno como R$150.",
+    };
+  }
+
+  if (returnCents <= valueCents) {
+    return { error: "O retorno precisa ser maior que o valor da entrada." };
+  }
+
+  return {
+    entry: {
+      id: makeId("entry"),
+      number,
+      valueCents,
+      valueText: formatCurrencyBRL(valueCents),
+      odd: odd,
+      oddText: odd === null ? null : formatOdd(odd),
+      returnCents,
+      returnText: formatCurrencyBRL(returnCents),
+      link,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function buildGreenFotoDraft(parts) {
+  if (parts.length === 0) {
+    const entry = getLatestPendingEntry();
+
+    if (!entry) {
+      return {
+        error:
+          "Não encontrei entrada pendente. Poste uma /entradafoto antes ou informe manualmente: /greenfoto 1 | R$100 | R$150.",
+      };
+    }
+
+    return {
+      entry,
+      number: entry.number,
+      valueText: entry.valueText,
+      returnText: entry.returnText,
+      resultCents: entry.returnCents - entry.valueCents,
+    };
+  }
+
+  if (parts.length === 1) {
+    const number = parseEntryNumber(parts[0]);
+
+    if (!number) {
+      return { error: "Número da entrada inválido. Use algo como /greenfoto 2." };
+    }
+
+    const entry = findEntryByNumber(number);
+
+    if (!entry) {
+      return { error: `Não encontrei a ${getOrdinalEntrada(number)} entrada no histórico.` };
+    }
+
+    if (entry.status !== "pending") {
+      return { error: `A ${getOrdinalEntrada(number)} entrada já foi finalizada como ${entry.status}.` };
+    }
+
+    return {
+      entry,
+      number: entry.number,
+      valueText: entry.valueText,
+      returnText: entry.returnText,
+      resultCents: entry.returnCents - entry.valueCents,
+    };
+  }
+
+  if (parts.length < 3) {
+    return {
+      error:
+        "Formato inválido. Use /greenfoto, /greenfoto NÚMERO ou /greenfoto NÚMERO | VALOR_ENTRADA | RETORNO.",
+    };
+  }
+
+  const number = parseEntryNumber(parts[0]);
+  const valueCents = parseCurrencyCents(parts[1]);
+  const returnCents = parseCurrencyCents(parts[2]);
+
+  if (!number) {
+    return { error: "Número da entrada inválido. Use um número inteiro, como 1, 2 ou 3." };
+  }
+
+  if (valueCents === null || valueCents <= 0) {
+    return { error: "Valor de entrada inválido. Use algo como R$100 ou R$100,50." };
+  }
+
+  if (returnCents === null || returnCents <= 0) {
+    return { error: "Retorno inválido. Use algo como R$150 ou R$150,50." };
+  }
+
+  const manualResultCents = parts[3] ? parseCurrencyCents(parts[3]) : null;
+
+  if (parts[3] && manualResultCents === null) {
+    return { error: "Resultado manual inválido. Use algo como +R$50." };
+  }
+
+  const resultCents =
+    manualResultCents === null ? returnCents - valueCents : manualResultCents;
+
+  if (resultCents <= 0) {
+    return { error: "O resultado do green precisa ser positivo." };
+  }
+
+  const entry = findEntryByNumber(number);
+
+  if (entry && entry.status !== "pending") {
+    return { error: `A ${getOrdinalEntrada(number)} entrada já foi finalizada como ${entry.status}.` };
+  }
+
+  return {
+    entry,
+    number,
+    valueText: formatCurrencyBRL(valueCents),
+    returnText: formatCurrencyBRL(returnCents),
+    resultCents,
+  };
+}
+
+function buildRedDraft(text) {
+  const raw = String(text || "").trim();
+
+  if (!raw) {
+    const entry = getLatestPendingEntry();
+
+    if (!entry) {
+      return {
+        error:
+          "Não encontrei entrada pendente. Use /red NÚMERO ou informe o prejuízo manualmente, como /red -R$100.",
+      };
+    }
+
+    return {
+      entry,
+      number: entry.number,
+      valueText: entry.valueText,
+      resultCents: -entry.valueCents,
+    };
+  }
+
+  const number = parseEntryNumber(raw);
+
+  if (number) {
+    const entry = findEntryByNumber(number);
+
+    if (!entry) {
+      return { error: `Não encontrei a ${getOrdinalEntrada(number)} entrada no histórico.` };
+    }
+
+    if (entry.status !== "pending") {
+      return { error: `A ${getOrdinalEntrada(number)} entrada já foi finalizada como ${entry.status}.` };
+    }
+
+    return {
+      entry,
+      number: entry.number,
+      valueText: entry.valueText,
+      resultCents: -entry.valueCents,
+    };
+  }
+
+  const lossCents = parseCurrencyCents(raw);
+
+  if (lossCents === null || lossCents === 0) {
+    return {
+      error:
+        "Prejuízo inválido. Use /red, /red NÚMERO ou informe um valor como /red -R$100.",
+    };
+  }
+
+  return {
+    resultCents: lossCents > 0 ? -lossCents : lossCents,
+  };
+}
+
+function getDateKey(dateInput = new Date()) {
+  const parts = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: BOT_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(dateInput));
+
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function buildDailySummary() {
+  const todayKey = getDateKey();
+  const todaysResults = appState.results.filter(
+    (result) => getDateKey(result.createdAt) === todayKey
+  );
+  const greens = todaysResults.filter((result) => result.type === "green").length;
+  const reds = todaysResults.filter((result) => result.type === "red").length;
+  const closed = greens + reds;
+  const dailyTotal = todaysResults.reduce(
+    (total, result) => total + (Number(result.resultCents) || 0),
+    0
+  );
+  const allTimeTotal = appState.results.reduce(
+    (total, result) => total + (Number(result.resultCents) || 0),
+    0
+  );
+  const pending = appState.entries.filter((entry) => entry.status === "pending");
+  const accuracy = closed ? Math.round((greens / closed) * 100) : 0;
+  const projectStart = appState.projectStartCents;
+  const projectLine =
+    projectStart === null
+      ? "Projeto: sem entradas registradas"
+      : `Projeto: ${formatCurrencyBRL(projectStart)} → ${formatCurrencyBRL(
+          projectStart + allTimeTotal
+        )}`;
+
+  return {
+    greens,
+    reds,
+    closed,
+    pendingCount: pending.length,
+    latestPending: pending.sort((a, b) => b.number - a.number)[0],
+    accuracy,
+    dailyTotal,
+    projectLine,
+  };
+}
+
 function isValidUrl(url) {
   try {
     const parsedUrl = new URL(url);
@@ -189,12 +609,14 @@ async function sendTargetMessage(msg, command, sendFn) {
     await sendFn();
     logInfo("Postagem enviada", commandContext(msg, command));
     await bot.sendMessage(msg.chat.id, "Postagem enviada ✅");
+    return true;
   } catch (error) {
     logError("Erro ao enviar postagem", error, commandContext(msg, command));
     await bot.sendMessage(
       msg.chat.id,
       "Deu erro ao postar. Confira o terminal e as permissões do bot no canal/grupo."
     );
+    return false;
   }
 }
 
@@ -210,6 +632,8 @@ async function validateLinkOrReply(msg, link) {
   return false;
 }
 
+let appState = loadState();
+
 bot.onText(/\/start|\/help/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
@@ -220,15 +644,22 @@ Comandos:
 /chatid - ver ID deste grupo/canal
 /status - ver se o bot está configurado
 /teste - testar envio
+/resumo - resumo do dia
 
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
+/entradafoto VALOR_ENTRADA | ODD | LINK
 /entradafoto NÚMERO | VALOR_ENTRADA | RETORNO | LINK
 /green JOGO | ODD | RETORNO
+/greenfoto
+/greenfoto NÚMERO
 /greenfoto NÚMERO | VALOR_ENTRADA | RETORNO
+/red
+/red NÚMERO
 /red PREJUÍZO
 
 Exemplo:
-/entrada COPA DO BRASIL | Corinthians x Barra FC | Mais de 0.5 gol no 1º tempo | 1.73 | 1 unidade | https://google.com`
+/entradafoto R$100 | 1.50 | https://google.com
+/greenfoto`
   );
 });
 
@@ -249,7 +680,9 @@ bot.onText(/\/status/, async (msg) => {
     msg.chat.id,
     `Bot online ✅
 Chat alvo: ${TARGET_CHAT}
-Admins configurados: ${ADMIN_IDS.size}`
+Admins configurados: ${ADMIN_IDS.size}
+Entradas pendentes: ${appState.entries.filter((entry) => entry.status === "pending").length}
+Próxima entrada: ${getNextEntryNumber()}ª`
   );
 });
 
@@ -261,6 +694,36 @@ bot.onText(/\/teste/, async (msg) => {
   await sendTargetMessage(msg, "teste", () =>
     bot.sendMessage(TARGET_CHAT, "Teste de postagem do bot ✅")
   );
+});
+
+bot.onText(/\/resumo/, async (msg) => {
+  if (await denyIfNotAdmin(msg, "resumo")) {
+    return;
+  }
+
+  const resumo = buildDailySummary();
+  const pendente = resumo.latestPending
+    ? `\n⏳ <b>Última pendente:</b> ${getOrdinalEntrada(resumo.latestPending.number)} entrada (${escapeHtml(
+        resumo.latestPending.valueText
+      )} → ${escapeHtml(resumo.latestPending.returnText)})`
+    : "";
+
+  const mensagem = `
+📊 <b>Resumo do dia</b>
+
+✅ <b>Greens:</b> ${resumo.greens}
+❌ <b>Reds:</b> ${resumo.reds}
+🎯 <b>Assertividade:</b> ${resumo.closed ? `${resumo.accuracy}%` : "sem entradas finalizadas"}
+📈 <b>Resultado do dia:</b> ${formatCurrencyBRL(resumo.dailyTotal, { signed: true })}
+📌 <b>Pendentes:</b> ${resumo.pendingCount}${pendente}
+
+💼 <b>${escapeHtml(resumo.projectLine)}</b>
+`;
+
+  await bot.sendMessage(msg.chat.id, mensagem, {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
 });
 
 bot.onText(/\/entrada (.+)/, async (msg, match) => {
@@ -342,29 +805,38 @@ bot.on("photo", async (msg) => {
     const conteudo = caption.replace("/entradafoto", "").trim();
     const partes = parseFields(conteudo, 4);
 
-    if (partes.length < 4) {
+    if (partes.length < 3) {
       return bot.sendMessage(
         msg.chat.id,
         `Formato inválido.
 
 Envie a FOTO do bilhete com esta legenda:
 
-/entradafoto NÚMERO | VALOR_ENTRADA | RETORNO | LINK
+/entradafoto VALOR_ENTRADA | ODD | LINK
 
 Exemplo:
+/entradafoto R$100 | 1.50 | https://google.com
+
+Também aceito o formato antigo:
 /entradafoto 1 | R$100 | R$150 | https://google.com`
       );
     }
 
-    const [numeroEntrada, valorEntrada, retorno, link] = partes;
+    const draft = buildEntradaFotoDraft(partes);
 
-    if (!(await validateLinkOrReply(msg, link))) {
+    if (draft.error) {
+      return bot.sendMessage(msg.chat.id, draft.error);
+    }
+
+    const { entry } = draft;
+
+    if (!(await validateLinkOrReply(msg, entry.link))) {
       return;
     }
 
-    const numero = escapeHtml(numeroEntrada);
-    const valor = escapeHtml(valorEntrada);
-    const ganho = escapeHtml(retorno);
+    const numero = escapeHtml(entry.number);
+    const valor = escapeHtml(entry.valueText);
+    const ganho = escapeHtml(entry.returnText);
 
     const legenda = `
 ⭐ <b>${getOrdinalEntrada(numero)} Entrada Projeto 1K 📊</b>
@@ -387,11 +859,14 @@ ${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
             [
               {
                 text: "✅ COPIAR BILHETE",
-                url: link,
+                url: entry.link,
               },
             ],
           ],
         },
+      }).then(() => {
+        registerPendingEntry(entry);
+        saveState();
       })
     );
   }
@@ -400,41 +875,16 @@ ${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
     const conteudo = caption.replace("/greenfoto", "").trim();
     const partes = parseFields(conteudo, 4);
 
-    if (partes.length < 3) {
-      return bot.sendMessage(
-        msg.chat.id,
-        `Formato inválido.
+    const draft = buildGreenFotoDraft(partes);
 
-Envie a FOTO do green com esta legenda:
-
-/greenfoto NÚMERO | VALOR_ENTRADA | RETORNO
-
-Exemplo:
-/greenfoto 1 | R$100 | R$150`
-      );
+    if (draft.error) {
+      return bot.sendMessage(msg.chat.id, draft.error);
     }
 
-    const [numeroEntrada, valorEntrada, retorno, resultadoManual] = partes;
-    const resultadoCalculado = calculateGreenResult(valorEntrada, retorno);
-    const resultado = resultadoManual || resultadoCalculado;
-
-    if (!resultado) {
-      return bot.sendMessage(
-        msg.chat.id,
-        `Não consegui calcular o resultado.
-
-Use valores em reais no VALOR_ENTRADA e RETORNO:
-
-/greenfoto 1 | R$100 | R$150
-
-Se preferir, envie o RESULTADO manualmente como 4º campo.`
-      );
-    }
-
-    const numero = escapeHtml(numeroEntrada);
-    const valor = escapeHtml(valorEntrada);
-    const ganho = escapeHtml(retorno);
-    const lucro = escapeHtml(resultado);
+    const numero = escapeHtml(draft.number);
+    const valor = escapeHtml(draft.valueText);
+    const ganho = escapeHtml(draft.returnText);
+    const lucro = escapeHtml(formatCurrencyBRL(draft.resultCents, { signed: true }));
 
     const legenda = `
 ✅✅✅ <b>GREEN CONFIRMADO!</b> ✅✅✅
@@ -456,6 +906,18 @@ ${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
       bot.sendPhoto(TARGET_CHAT, foto, {
         caption: legenda,
         parse_mode: "HTML",
+      }).then(() => {
+        if (draft.entry) {
+          closeEntry(draft.entry, "green", draft.resultCents, "greenfoto");
+        } else {
+          recordManualResult("green", draft.resultCents, "greenfoto", {
+            number: draft.number,
+            valueCents: parseCurrencyCents(draft.valueText),
+            returnCents: parseCurrencyCents(draft.returnText),
+          });
+        }
+
+        saveState();
       })
     );
   }
@@ -506,32 +968,40 @@ Exemplo:
     bot.sendMessage(TARGET_CHAT, mensagem, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
+    }).then(() => {
+      if (isCurrencyLike(retorno)) {
+        const resultCents = parseCurrencyCents(retorno);
+
+        if (resultCents !== null && resultCents > 0) {
+          recordManualResult("green", resultCents, "green");
+          saveState();
+        }
+      }
     })
   );
 });
 
-bot.onText(/\/red (.+)/, async (msg, match) => {
+bot.onText(/^\/red(?:\s+(.+))?$/, async (msg, match) => {
   if (await denyIfNotAdmin(msg, "red")) {
     return;
   }
 
-  const prejuizo = match[1].trim();
+  const draft = buildRedDraft(match[1]);
 
-  if (!prejuizo) {
-    return bot.sendMessage(
-      msg.chat.id,
-      `Formato inválido.
-
-Use assim:
-/red PREJUÍZO
-
-Exemplo:
-/red -R$100`
-    );
+  if (draft.error) {
+    return bot.sendMessage(msg.chat.id, draft.error);
   }
+
+  const prejuizo = formatCurrencyBRL(draft.resultCents, { signed: true });
+  const entrada = draft.number
+    ? `\n⭐ <b>Entrada:</b> ${getOrdinalEntrada(escapeHtml(draft.number))} (${escapeHtml(
+        draft.valueText
+      )})`
+    : "";
 
   const mensagem = `
 ❌ <b>RED NA ENTRADA</b>
+${entrada}
 
 📉 <b>Prejuízo:</b> ${escapeHtml(prejuizo)}
 
@@ -546,6 +1016,14 @@ Exemplo:
     bot.sendMessage(TARGET_CHAT, mensagem, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
+    }).then(() => {
+      if (draft.entry) {
+        closeEntry(draft.entry, "red", draft.resultCents, "red");
+      } else {
+        recordManualResult("red", draft.resultCents, "red");
+      }
+
+      saveState();
     })
   );
 });
