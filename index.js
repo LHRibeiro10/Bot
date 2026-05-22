@@ -6,6 +6,34 @@ const TelegramBot = require("node-telegram-bot-api");
 const REQUIRED_ENVS = ["BOT_TOKEN", "TARGET_CHAT"];
 const STATE_FILE = path.join(__dirname, "state.json");
 const BOT_TIME_ZONE = process.env.BOT_TIME_ZONE || "America/Sao_Paulo";
+const FIRST_ENTRY_BACKFILL = {
+  entry: {
+    id: "entry_manual_1",
+    number: 1,
+    valueCents: 10000,
+    valueText: "R$100",
+    odd: null,
+    oddText: null,
+    returnCents: 15163,
+    returnText: "R$151,63",
+    link: "",
+    status: "green",
+    createdAt: "2026-05-22T03:16:00.000Z",
+    resultCents: 5163,
+    closedAt: "2026-05-22T03:16:00.000Z",
+  },
+  result: {
+    id: "result_manual_1",
+    createdAt: "2026-05-22T03:16:00.000Z",
+    type: "green",
+    source: "manual-backfill",
+    entryId: "entry_manual_1",
+    number: 1,
+    valueCents: 10000,
+    returnCents: 15163,
+    resultCents: 5163,
+  },
+};
 
 function readRequiredEnv(name) {
   const value = process.env[name];
@@ -245,10 +273,33 @@ function loadState() {
   }
 }
 
+function applyFirstEntryBackfill(state) {
+  const hasEntries = state.entries.length > 0;
+  const hasResults = state.results.length > 0;
+
+  if (hasEntries || hasResults) {
+    return false;
+  }
+
+  state.entries.push({ ...FIRST_ENTRY_BACKFILL.entry });
+  state.results.push({ ...FIRST_ENTRY_BACKFILL.result });
+  state.projectStartCents = FIRST_ENTRY_BACKFILL.entry.valueCents;
+  state.nextEntryNumber = 2;
+  return true;
+}
+
 function saveState() {
   const tempFile = `${STATE_FILE}.tmp`;
   fs.writeFileSync(tempFile, `${JSON.stringify(appState, null, 2)}\n`);
   fs.renameSync(tempFile, STATE_FILE);
+}
+
+function refreshStateFromDisk() {
+  appState = loadState();
+
+  if (applyFirstEntryBackfill(appState)) {
+    saveState();
+  }
 }
 
 function makeId(prefix) {
@@ -665,6 +716,11 @@ async function validateLinkOrReply(msg, link) {
 }
 
 let appState = loadState();
+
+if (applyFirstEntryBackfill(appState)) {
+  saveState();
+}
+
 const pendingResumoMessages = new Map();
 
 bot.onText(/\/start|\/help/, (msg) => {
@@ -709,6 +765,8 @@ bot.onText(/\/status/, async (msg) => {
     return;
   }
 
+  refreshStateFromDisk();
+
   bot.sendMessage(
     msg.chat.id,
     `Bot online ✅
@@ -733,6 +791,8 @@ bot.onText(/\/resumo/, async (msg) => {
   if (await denyIfNotAdmin(msg, "resumo")) {
     return;
   }
+
+  refreshStateFromDisk();
 
   const requestId = makeId("rs");
   const mensagem = buildDailySummaryMessage();
