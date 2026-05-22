@@ -576,6 +576,27 @@ function buildDailySummary() {
   };
 }
 
+function buildDailySummaryMessage() {
+  const resumo = buildDailySummary();
+  const pendente = resumo.latestPending
+    ? `\n⏳ <b>Última pendente:</b> ${getOrdinalEntrada(resumo.latestPending.number)} entrada (${escapeHtml(
+        resumo.latestPending.valueText
+      )} → ${escapeHtml(resumo.latestPending.returnText)})`
+    : "";
+
+  return `
+📊 <b>Resumo do dia</b>
+
+✅ <b>Greens:</b> ${resumo.greens}
+❌ <b>Reds:</b> ${resumo.reds}
+🎯 <b>Assertividade:</b> ${resumo.closed ? `${resumo.accuracy}%` : "sem entradas finalizadas"}
+📈 <b>Resultado do dia:</b> ${formatCurrencyBRL(resumo.dailyTotal, { signed: true })}
+📌 <b>Pendentes:</b> ${resumo.pendingCount}${pendente}
+
+💼 <b>${escapeHtml(resumo.projectLine)}</b>
+`;
+}
+
 function isValidUrl(url) {
   try {
     const parsedUrl = new URL(url);
@@ -620,6 +641,17 @@ async function sendTargetMessage(msg, command, sendFn) {
   }
 }
 
+async function clearMessageButtons(chatId, messageId) {
+  try {
+    await bot.editMessageReplyMarkup(
+      { inline_keyboard: [] },
+      { chat_id: chatId, message_id: messageId }
+    );
+  } catch (error) {
+    logError("Erro ao remover botões da mensagem", error, { chatId, messageId });
+  }
+}
+
 async function validateLinkOrReply(msg, link) {
   if (isValidUrl(link)) {
     return true;
@@ -633,6 +665,7 @@ async function validateLinkOrReply(msg, link) {
 }
 
 let appState = loadState();
+const pendingResumoMessages = new Map();
 
 bot.onText(/\/start|\/help/, (msg) => {
   bot.sendMessage(
@@ -644,7 +677,7 @@ Comandos:
 /chatid - ver ID deste grupo/canal
 /status - ver se o bot está configurado
 /teste - testar envio
-/resumo - resumo do dia
+/resumo - prévia do resumo com confirmação para enviar ao grupo
 
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
 /entradafoto VALOR_ENTRADA | ODD | LINK
@@ -701,29 +734,118 @@ bot.onText(/\/resumo/, async (msg) => {
     return;
   }
 
-  const resumo = buildDailySummary();
-  const pendente = resumo.latestPending
-    ? `\n⏳ <b>Última pendente:</b> ${getOrdinalEntrada(resumo.latestPending.number)} entrada (${escapeHtml(
-        resumo.latestPending.valueText
-      )} → ${escapeHtml(resumo.latestPending.returnText)})`
-    : "";
+  const requestId = makeId("rs");
+  const mensagem = buildDailySummaryMessage();
 
-  const mensagem = `
-📊 <b>Resumo do dia</b>
+  try {
+    const preview = await bot.sendMessage(msg.from.id, mensagem, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Enviar no grupo",
+              callback_data: `resumo_send:${requestId}`,
+            },
+          ],
+          [
+            {
+              text: "Cancelar",
+              callback_data: `resumo_cancel:${requestId}`,
+            },
+          ],
+        ],
+      },
+    });
 
-✅ <b>Greens:</b> ${resumo.greens}
-❌ <b>Reds:</b> ${resumo.reds}
-🎯 <b>Assertividade:</b> ${resumo.closed ? `${resumo.accuracy}%` : "sem entradas finalizadas"}
-📈 <b>Resultado do dia:</b> ${formatCurrencyBRL(resumo.dailyTotal, { signed: true })}
-📌 <b>Pendentes:</b> ${resumo.pendingCount}${pendente}
+    pendingResumoMessages.set(requestId, {
+      userId: msg.from.id,
+      message: mensagem,
+      chatId: preview.chat.id,
+      messageId: preview.message_id,
+      createdAt: Date.now(),
+    });
 
-💼 <b>${escapeHtml(resumo.projectLine)}</b>
-`;
+    if (msg.chat.id !== msg.from.id) {
+      await bot.sendMessage(msg.chat.id, "Te mandei o resumo no privado para confirmar o envio.");
+    }
+  } catch (error) {
+    logError("Erro ao enviar preview do resumo no privado", error, commandContext(msg, "resumo"));
+    await bot.sendMessage(
+      msg.chat.id,
+      "Não consegui te mandar o resumo no privado. Abra uma conversa com o bot e envie /start primeiro."
+    );
+  }
+});
 
-  await bot.sendMessage(msg.chat.id, mensagem, {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+bot.on("callback_query", async (query) => {
+  const data = query.data || "";
+  const match = /^resumo_(send|cancel):(.+)$/.exec(data);
+
+  if (!match) {
+    return;
+  }
+
+  const [, action, requestId] = match;
+  const pending = pendingResumoMessages.get(requestId);
+
+  if (!ADMIN_IDS.has(query.from.id)) {
+    return bot.answerCallbackQuery(query.id, {
+      text: "Você não tem permissão para confirmar este envio.",
+      show_alert: true,
+    });
+  }
+
+  if (!pending) {
+    return bot.answerCallbackQuery(query.id, {
+      text: "Essa confirmação expirou ou já foi usada.",
+      show_alert: true,
+    });
+  }
+
+  if (pending.userId !== query.from.id) {
+    return bot.answerCallbackQuery(query.id, {
+      text: "Essa confirmação pertence a outro admin.",
+      show_alert: true,
+    });
+  }
+
+  if (action === "cancel") {
+    pendingResumoMessages.delete(requestId);
+    await bot.answerCallbackQuery(query.id, { text: "Envio cancelado." });
+    await clearMessageButtons(pending.chatId, pending.messageId);
+    return bot.sendMessage(pending.chatId, "Envio do resumo cancelado.");
+  }
+
+  await bot.answerCallbackQuery(query.id, { text: "Enviando resumo..." });
+
+  try {
+    await bot.sendMessage(TARGET_CHAT, pending.message, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+    });
+    pendingResumoMessages.delete(requestId);
+    await clearMessageButtons(pending.chatId, pending.messageId);
+    logInfo("Resumo enviado após confirmação", {
+      command: "resumo",
+      userId: query.from.id,
+      username: query.from.username,
+      chatId: pending.chatId,
+    });
+    await bot.sendMessage(pending.chatId, "Resumo enviado no grupo ✅");
+  } catch (error) {
+    logError("Erro ao enviar resumo confirmado", error, {
+      command: "resumo",
+      userId: query.from.id,
+      username: query.from.username,
+      chatId: pending.chatId,
+    });
+    await bot.sendMessage(
+      pending.chatId,
+      "Deu erro ao enviar o resumo no grupo. Confira o terminal e as permissões do bot."
+    );
+  }
 });
 
 bot.onText(/\/entrada (.+)/, async (msg, match) => {
