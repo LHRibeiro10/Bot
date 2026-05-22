@@ -88,6 +88,74 @@ function parseFields(text, expectedCount) {
     .slice(0, expectedCount);
 }
 
+function parseCurrencyCents(value) {
+  const raw = String(value || "").trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  const sign = raw.includes("-") ? -1 : 1;
+  const cleaned = raw.replace(/[^\d.,]/g, "");
+
+  if (!/\d/.test(cleaned)) {
+    return null;
+  }
+
+  const lastComma = cleaned.lastIndexOf(",");
+  const lastDot = cleaned.lastIndexOf(".");
+  const decimalIndex = Math.max(lastComma, lastDot);
+
+  let integerPart = cleaned.replace(/\D/g, "");
+  let decimalPart = "";
+
+  if (decimalIndex >= 0) {
+    const left = cleaned.slice(0, decimalIndex);
+    const right = cleaned.slice(decimalIndex + 1);
+    const rightDigits = right.replace(/\D/g, "");
+
+    if (rightDigits.length > 0 && rightDigits.length <= 2) {
+      integerPart = left.replace(/\D/g, "") || "0";
+      decimalPart = rightDigits.padEnd(2, "0").slice(0, 2);
+    }
+  }
+
+  const reais = Number(integerPart || "0");
+  const centavos = Number(decimalPart || "0");
+  const totalCents = reais * 100 + centavos;
+
+  if (!Number.isSafeInteger(totalCents)) {
+    return null;
+  }
+
+  return sign * totalCents;
+}
+
+function formatIntegerBR(value) {
+  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+}
+
+function formatCurrencyBRL(cents, { signed = false } = {}) {
+  const sign = cents < 0 ? "-" : signed && cents > 0 ? "+" : "";
+  const absoluteCents = Math.abs(cents);
+  const reais = Math.floor(absoluteCents / 100);
+  const centavos = absoluteCents % 100;
+  const decimal = centavos ? `,${String(centavos).padStart(2, "0")}` : "";
+
+  return `${sign}R$${formatIntegerBR(reais)}${decimal}`;
+}
+
+function calculateGreenResult(valorEntrada, retorno) {
+  const entradaCents = parseCurrencyCents(valorEntrada);
+  const retornoCents = parseCurrencyCents(retorno);
+
+  if (entradaCents === null || retornoCents === null) {
+    return null;
+  }
+
+  return formatCurrencyBRL(retornoCents - entradaCents, { signed: true });
+}
+
 function isValidUrl(url) {
   try {
     const parsedUrl = new URL(url);
@@ -156,7 +224,7 @@ Comandos:
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
 /entradafoto NÚMERO | VALOR_ENTRADA | RETORNO | LINK
 /green JOGO | ODD | RETORNO
-/greenfoto NÚMERO | VALOR_ENTRADA | RETORNO | RESULTADO
+/greenfoto NÚMERO | VALOR_ENTRADA | RETORNO
 /red PREJUÍZO
 
 Exemplo:
@@ -332,21 +400,37 @@ ${getOrdinalEntrada(numero)} <b>${valor} → ${ganho}</b> 🚀🚀
     const conteudo = caption.replace("/greenfoto", "").trim();
     const partes = parseFields(conteudo, 4);
 
-    if (partes.length < 4) {
+    if (partes.length < 3) {
       return bot.sendMessage(
         msg.chat.id,
         `Formato inválido.
 
 Envie a FOTO do green com esta legenda:
 
-/greenfoto NÚMERO | VALOR_ENTRADA | RETORNO | RESULTADO
+/greenfoto NÚMERO | VALOR_ENTRADA | RETORNO
 
 Exemplo:
-/greenfoto 1 | R$100 | R$150 | +R$50`
+/greenfoto 1 | R$100 | R$150`
       );
     }
 
-    const [numeroEntrada, valorEntrada, retorno, resultado] = partes;
+    const [numeroEntrada, valorEntrada, retorno, resultadoManual] = partes;
+    const resultadoCalculado = calculateGreenResult(valorEntrada, retorno);
+    const resultado = resultadoManual || resultadoCalculado;
+
+    if (!resultado) {
+      return bot.sendMessage(
+        msg.chat.id,
+        `Não consegui calcular o resultado.
+
+Use valores em reais no VALOR_ENTRADA e RETORNO:
+
+/greenfoto 1 | R$100 | R$150
+
+Se preferir, envie o RESULTADO manualmente como 4º campo.`
+      );
+    }
+
     const numero = escapeHtml(numeroEntrada);
     const valor = escapeHtml(valorEntrada);
     const ganho = escapeHtml(retorno);
