@@ -336,6 +336,12 @@ function getLatestPendingEntry() {
     .sort((a, b) => b.number - a.number)[0];
 }
 
+function getLatestPendingEntryByKind(kind) {
+  return appState.entries
+    .filter((entry) => entry.status === "pending" && entry.kind === kind)
+    .sort((a, b) => b.number - a.number)[0];
+}
+
 function recordResult(result) {
   appState.results.push({
     id: makeId("result"),
@@ -344,9 +350,10 @@ function recordResult(result) {
   });
 }
 
-function closeEntry(entry, type, resultCents, source) {
+function closeEntry(entry, type, resultCents, source, data = {}) {
   entry.status = type;
   entry.resultCents = resultCents;
+  entry.resultText = data.resultText || entry.resultText;
   entry.closedAt = new Date().toISOString();
 
   recordResult({
@@ -357,6 +364,7 @@ function closeEntry(entry, type, resultCents, source) {
     valueCents: entry.valueCents,
     returnCents: entry.returnCents,
     resultCents,
+    ...data,
   });
 }
 
@@ -521,6 +529,20 @@ function buildGreenFotoDraft(parts) {
   };
 }
 
+function getEntryLossDraft(entry) {
+  if (Number.isSafeInteger(entry.valueCents) && entry.valueCents > 0) {
+    return {
+      resultCents: -entry.valueCents,
+      resultText: null,
+    };
+  }
+
+  return {
+    resultCents: null,
+    resultText: "prejuízo não informado",
+  };
+}
+
 function buildRedDraft(text) {
   const raw = String(text || "").trim();
 
@@ -534,11 +556,13 @@ function buildRedDraft(text) {
       };
     }
 
+    const loss = getEntryLossDraft(entry);
+
     return {
       entry,
       number: entry.number,
       valueText: entry.valueText,
-      resultCents: -entry.valueCents,
+      ...loss,
     };
   }
 
@@ -555,11 +579,13 @@ function buildRedDraft(text) {
       return { error: `A ${getOrdinalEntrada(number)} entrada já foi finalizada como ${entry.status}.` };
     }
 
+    const loss = getEntryLossDraft(entry);
+
     return {
       entry,
       number: entry.number,
       valueText: entry.valueText,
-      resultCents: -entry.valueCents,
+      ...loss,
     };
   }
 
@@ -771,6 +797,7 @@ function buildHistoryStats() {
   const closedEntries = appState.entries.filter(
     (entry) => entry.status === "green" || entry.status === "red"
   );
+  const manualResults = results.filter((result) => !result.entryId);
   const bestGreen = results
     .filter((result) => result.type === "green")
     .sort((a, b) => (Number(b.resultCents) || 0) - (Number(a.resultCents) || 0))[0];
@@ -787,10 +814,11 @@ function buildHistoryStats() {
     greens,
     reds,
     closed,
-    totalEntries: appState.entries.length,
-    closedEntries: closedEntries.length,
+    totalEntries: appState.entries.length + manualResults.length,
+    closedEntries: closedEntries.length + manualResults.length,
     pendingEntries: pendingEntries.length,
-    manualResults: results.filter((result) => !result.entryId).length,
+    manualResults: manualResults.length,
+    manualResultItems: manualResults,
     totalResultCents,
     knownStakeCents,
     averageResultCents: closed ? Math.round(totalResultCents / closed) : 0,
@@ -807,16 +835,45 @@ function buildHistoryStats() {
 
 function buildCompactEntryLine(entry) {
   const status = getEntryStatusLabel(entry.status);
+  const hasNumericResult = Number.isSafeInteger(entry.resultCents);
+  const resultText = entry.resultText
+    ? ` | ${escapeHtml(entry.resultText)}`
+    : hasNumericResult
+    ? ` | ${escapeHtml(formatCurrencyBRL(entry.resultCents, { signed: true }))}`
+    : "";
+
+  if (entry.kind === "entrada" || entry.jogo) {
+    const jogo = entry.jogo || "Jogo não informado";
+    const oddText = entry.oddText || entry.odd;
+    const odd = oddText ? ` | odd ${escapeHtml(oddText)}` : "";
+
+    return `${escapeHtml(getOrdinalEntrada(entry.number))} <b>${status}</b> | ${escapeHtml(
+      jogo
+    )}${odd}${resultText}`;
+  }
+
   const valueText = entry.valueText || formatCurrencyBRL(Number(entry.valueCents) || 0);
   const returnText = entry.returnText || formatCurrencyBRL(Number(entry.returnCents) || 0);
-  const resultCents = Number(entry.resultCents);
-  const resultText = Number.isSafeInteger(resultCents)
-    ? ` | ${escapeHtml(formatCurrencyBRL(resultCents, { signed: true }))}`
-    : "";
 
   return `${escapeHtml(getOrdinalEntrada(entry.number))} <b>${status}</b> | ${escapeHtml(
     valueText
   )} -> ${escapeHtml(returnText)}${resultText}`;
+}
+
+function buildCompactResultLine(result) {
+  const status = getEntryStatusLabel(result.type);
+  const numberText = result.number ? `${getOrdinalEntrada(result.number)} ` : "";
+  const hasNumericResult = Number.isSafeInteger(result.resultCents);
+  const resultText = result.resultText
+    ? ` | ${escapeHtml(result.resultText)}`
+    : hasNumericResult
+    ? ` | ${escapeHtml(formatCurrencyBRL(result.resultCents, { signed: true }))}`
+    : "";
+  const jogo = result.jogo ? ` | ${escapeHtml(result.jogo)}` : "";
+  const oddText = result.oddText || result.odd;
+  const odd = oddText ? ` | odd ${escapeHtml(oddText)}` : "";
+
+  return `${escapeHtml(numberText)}<b>${status}</b>${jogo}${odd}${resultText}`;
 }
 
 function splitLongMessage(header, lines, emptyText) {
@@ -846,11 +903,22 @@ function splitLongMessage(header, lines, emptyText) {
 
 function buildHistoryMessages() {
   const history = buildHistoryStats();
-  const entries = [...appState.entries].sort((a, b) => {
-    const numberDiff = (Number(a.number) || 0) - (Number(b.number) || 0);
+  const historyItems = [
+    ...appState.entries.map((entry) => ({
+      number: Number(entry.number) || Number.MAX_SAFE_INTEGER,
+      createdAt: entry.createdAt,
+      line: buildCompactEntryLine(entry),
+    })),
+    ...history.manualResultItems.map((result) => ({
+      number: Number(result.number) || Number.MAX_SAFE_INTEGER,
+      createdAt: result.createdAt,
+      line: buildCompactResultLine(result),
+    })),
+  ].sort((a, b) => {
+    const numberDiff = a.number - b.number;
     return numberDiff || getTimestamp(a.createdAt) - getTimestamp(b.createdAt);
   });
-  const entryLines = entries.map(buildCompactEntryLine);
+  const entryLines = historyItems.map((item) => item.line);
   const accuracyText =
     history.accuracy === null ? "sem entradas finalizadas" : formatPercentBR(history.accuracy);
   const roiText = history.roi === null ? "sem base de stake" : formatPercentBR(history.roi);
@@ -1236,6 +1304,23 @@ Exemplo:
   }
 
   const [campeonato, jogo, mercado, odd, unidade, link] = partes;
+  const entry = {
+    id: makeId("entry"),
+    kind: "entrada",
+    number: getNextEntryNumber(),
+    campeonato,
+    jogo,
+    mercado,
+    oddText: odd,
+    unidade,
+    valueCents: null,
+    valueText: unidade,
+    returnCents: null,
+    returnText: null,
+    link,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+  };
 
   if (!(await validateLinkOrReply(msg, link))) {
     return;
@@ -1274,6 +1359,9 @@ Exemplo:
           ],
         ],
       },
+    }).then(() => {
+      registerPendingEntry(entry);
+      saveState();
     })
   );
 });
@@ -1458,14 +1546,23 @@ Exemplo:
       parse_mode: "HTML",
       disable_web_page_preview: true,
     }).then(() => {
-      if (isCurrencyLike(retorno)) {
-        const resultCents = parseCurrencyCents(retorno);
+      const parsedResultCents = isCurrencyLike(retorno) ? parseCurrencyCents(retorno) : null;
+      const resultCents =
+        parsedResultCents !== null && parsedResultCents > 0 ? parsedResultCents : null;
+      const pendingEntry = getLatestPendingEntryByKind("entrada") || getLatestPendingEntry();
+      const resultData = {
+        jogo,
+        oddText: odd,
+        resultText: retorno,
+      };
 
-        if (resultCents !== null && resultCents > 0) {
-          recordManualResult("green", resultCents, "green");
-          saveState();
-        }
+      if (pendingEntry) {
+        closeEntry(pendingEntry, "green", resultCents, "green", resultData);
+      } else {
+        recordManualResult("green", resultCents, "green", resultData);
       }
+
+      saveState();
     })
   );
 });
@@ -1481,7 +1578,7 @@ bot.onText(/^\/red(?:\s+(.+))?$/, async (msg, match) => {
     return bot.sendMessage(msg.chat.id, draft.error);
   }
 
-  const prejuizo = formatCurrencyBRL(draft.resultCents, { signed: true });
+  const prejuizo = draft.resultText || formatCurrencyBRL(draft.resultCents, { signed: true });
   const entrada = draft.number
     ? `\n⭐ <b>Entrada:</b> ${getOrdinalEntrada(escapeHtml(draft.number))} (${escapeHtml(
         draft.valueText
@@ -1507,9 +1604,13 @@ ${entrada}
       disable_web_page_preview: true,
     }).then(() => {
       if (draft.entry) {
-        closeEntry(draft.entry, "red", draft.resultCents, "red");
+        closeEntry(draft.entry, "red", draft.resultCents, "red", {
+          resultText: draft.resultText,
+        });
       } else {
-        recordManualResult("red", draft.resultCents, "red");
+        recordManualResult("red", draft.resultCents, "red", {
+          resultText: draft.resultText,
+        });
       }
 
       saveState();
