@@ -805,76 +805,78 @@ function buildHistoryStats() {
   };
 }
 
-function buildRecentEntryLine(entry) {
+function buildCompactEntryLine(entry) {
   const status = getEntryStatusLabel(entry.status);
   const valueText = entry.valueText || formatCurrencyBRL(Number(entry.valueCents) || 0);
   const returnText = entry.returnText || formatCurrencyBRL(Number(entry.returnCents) || 0);
-  const oddText = entry.oddText ? ` | odd ${escapeHtml(entry.oddText)}` : "";
   const resultCents = Number(entry.resultCents);
   const resultText = Number.isSafeInteger(resultCents)
     ? ` | ${escapeHtml(formatCurrencyBRL(resultCents, { signed: true }))}`
     : "";
-  const dateText = formatDateTimeBR(entry.closedAt || entry.createdAt);
 
-  return `${escapeHtml(getOrdinalEntrada(entry.number))} - <b>${status}</b> - ${escapeHtml(
+  return `${escapeHtml(getOrdinalEntrada(entry.number))} <b>${status}</b> | ${escapeHtml(
     valueText
-  )} -> ${escapeHtml(returnText)}${oddText}${resultText} (${escapeHtml(dateText)})`;
+  )} -> ${escapeHtml(returnText)}${resultText}`;
 }
 
-function buildHistoryMessage(limit = 8) {
+function splitLongMessage(header, lines, emptyText) {
+  const maxLength = 3800;
+
+  if (!lines.length) {
+    return [`${header}\n${emptyText}`];
+  }
+
+  const messages = [];
+  let current = header;
+
+  for (const line of lines) {
+    const next = `${current}\n${line}`;
+
+    if (next.length > maxLength && current !== header) {
+      messages.push(current);
+      current = `${header}\n${line}`;
+    } else {
+      current = next;
+    }
+  }
+
+  messages.push(current);
+  return messages;
+}
+
+function buildHistoryMessages() {
   const history = buildHistoryStats();
-  const recentEntries = history.recentEntries.slice(0, limit);
-  const latestEntriesText = recentEntries.length
-    ? recentEntries.map(buildRecentEntryLine).join("\n")
-    : "Nenhuma entrada registrada em /entradafoto.";
+  const entries = [...appState.entries].sort((a, b) => {
+    const numberDiff = (Number(a.number) || 0) - (Number(b.number) || 0);
+    return numberDiff || getTimestamp(a.createdAt) - getTimestamp(b.createdAt);
+  });
+  const entryLines = entries.map(buildCompactEntryLine);
   const accuracyText =
     history.accuracy === null ? "sem entradas finalizadas" : formatPercentBR(history.accuracy);
   const roiText = history.roi === null ? "sem base de stake" : formatPercentBR(history.roi);
-  const firstDate = history.firstResult ? formatDateTimeBR(history.firstResult.createdAt) : null;
-  const latestDate = history.latestResult ? formatDateTimeBR(history.latestResult.createdAt) : null;
-  const periodText = firstDate && latestDate ? `${firstDate} até ${latestDate}` : "sem resultados";
   const manualResultsText = history.manualResults
-    ? `\nResultados manuais: ${history.manualResults}`
+    ? `\nResultados manuais: <b>${history.manualResults}</b>`
     : "";
-  const currentStreakText = history.streaks.currentType
-    ? `${getEntryStatusLabel(history.streaks.currentType)} x${history.streaks.currentCount}`
-    : "sem sequência";
   const projectText =
     appState.projectStartCents === null
       ? "sem valor inicial"
       : `${formatCurrencyBRL(appState.projectStartCents)} -> ${formatCurrencyBRL(
           appState.projectStartCents + history.totalResultCents
         )}`;
+  const header = `<b>Histórico do projeto</b>
 
-  return `
-<b>Histórico de entradas</b>
-
-Período: <b>${escapeHtml(periodText)}</b>
-Entradas registradas: <b>${history.totalEntries}</b>
-Entradas finalizadas: <b>${history.closedEntries}</b>
-Resultados finalizados: <b>${history.closed}</b>${escapeHtml(manualResultsText)}
-
-Greens: <b>${history.greens}</b>
-Reds: <b>${history.reds}</b>
-Assertividade: <b>${escapeHtml(accuracyText)}</b>
-Pendentes: <b>${history.pendingEntries}</b>
-
-Resultado total: <b>${escapeHtml(formatCurrencyBRL(history.totalResultCents, { signed: true }))}</b>
-Valor em entradas finalizadas: <b>${escapeHtml(formatCurrencyBRL(history.knownStakeCents))}</b>
-ROI: <b>${escapeHtml(roiText)}</b>
-Média por resultado: <b>${escapeHtml(
-    formatCurrencyBRL(history.averageResultCents, { signed: true })
+Entradas: <b>${history.totalEntries}</b> | Finalizadas: <b>${history.closedEntries}</b> | Pendentes: <b>${history.pendingEntries}</b>
+Greens: <b>${history.greens}</b> | Reds: <b>${history.reds}</b> | Assertividade: <b>${escapeHtml(
+    accuracyText
+  )}</b>${manualResultsText}
+Resultado: <b>${escapeHtml(formatCurrencyBRL(history.totalResultCents, { signed: true }))}</b> | ROI: <b>${escapeHtml(
+    roiText
   )}</b>
 Projeto: <b>${escapeHtml(projectText)}</b>
 
-Melhor green: <b>${getResultHighlight(history.bestGreen)}</b>
-Pior red: <b>${getResultHighlight(history.worstRed)}</b>
-Sequência atual: <b>${escapeHtml(currentStreakText)}</b>
-Maior sequência green: <b>${history.streaks.longestGreen}</b>
+<b>Todas as entradas</b>`;
 
-<b>Últimas ${recentEntries.length || 0} entradas</b>
-${latestEntriesText}
-`;
+  return splitLongMessage(header, entryLines, "Nenhuma entrada registrada em /entradafoto.");
 }
 
 function isValidUrl(url) {
@@ -951,6 +953,7 @@ if (applyFirstEntryBackfill(appState)) {
 }
 
 const pendingResumoMessages = new Map();
+const pendingHistoricoMessages = new Map();
 
 bot.onText(/\/start|\/help/, (msg) => {
   bot.sendMessage(
@@ -964,7 +967,7 @@ Comandos:
 /teste - testar envio
 /resumo - prévia do resumo com confirmação para enviar ao grupo
 
-/historico - histórico completo das entradas
+/historico - prévia do histórico com confirmação para enviar ao grupo
 
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
 /entradafoto VALOR_ENTRADA | ODD | LINK
@@ -1077,25 +1080,77 @@ bot.onText(/^\/historico(?:@\w+)?(?:\s+(\d{1,2}))?\s*$/, async (msg, match) => {
 
   refreshStateFromDisk();
 
-  const requestedLimit = match[1] ? Number(match[1]) : 8;
-  const limit = Math.min(Math.max(requestedLimit, 1), 20);
+  const requestId = makeId("hs");
+  const messages = buildHistoryMessages();
 
-  await bot.sendMessage(msg.chat.id, buildHistoryMessage(limit), {
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-  });
+  try {
+    for (const message of messages.slice(0, -1)) {
+      await bot.sendMessage(msg.from.id, message, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    const preview = await bot.sendMessage(msg.from.id, messages[messages.length - 1], {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Enviar no grupo",
+              callback_data: `historico_send:${requestId}`,
+            },
+          ],
+          [
+            {
+              text: "Cancelar",
+              callback_data: `historico_cancel:${requestId}`,
+            },
+          ],
+        ],
+      },
+    });
+
+    pendingHistoricoMessages.set(requestId, {
+      userId: msg.from.id,
+      messages,
+      chatId: preview.chat.id,
+      messageId: preview.message_id,
+      createdAt: Date.now(),
+    });
+
+    if (msg.chat.id !== msg.from.id) {
+      await bot.sendMessage(
+        msg.chat.id,
+        "Te mandei o histórico no privado para confirmar o envio."
+      );
+    }
+  } catch (error) {
+    logError(
+      "Erro ao enviar preview do histórico no privado",
+      error,
+      commandContext(msg, "historico")
+    );
+    await bot.sendMessage(
+      msg.chat.id,
+      "Não consegui te mandar o histórico no privado. Abra uma conversa com o bot e envie /start primeiro."
+    );
+  }
 });
 
 bot.on("callback_query", async (query) => {
   const data = query.data || "";
-  const match = /^resumo_(send|cancel):(.+)$/.exec(data);
+  const match = /^(resumo|historico)_(send|cancel):(.+)$/.exec(data);
 
   if (!match) {
     return;
   }
 
-  const [, action, requestId] = match;
-  const pending = pendingResumoMessages.get(requestId);
+  const [, type, action, requestId] = match;
+  const pendingMessages = type === "historico" ? pendingHistoricoMessages : pendingResumoMessages;
+  const pending = pendingMessages.get(requestId);
+  const label = type === "historico" ? "histórico" : "resumo";
 
   if (!ADMIN_IDS.has(query.from.id)) {
     return bot.answerCallbackQuery(query.id, {
@@ -1119,38 +1174,43 @@ bot.on("callback_query", async (query) => {
   }
 
   if (action === "cancel") {
-    pendingResumoMessages.delete(requestId);
+    pendingMessages.delete(requestId);
     await bot.answerCallbackQuery(query.id, { text: "Envio cancelado." });
     await clearMessageButtons(pending.chatId, pending.messageId);
-    return bot.sendMessage(pending.chatId, "Envio do resumo cancelado.");
+    return bot.sendMessage(pending.chatId, `Envio do ${label} cancelado.`);
   }
 
-  await bot.answerCallbackQuery(query.id, { text: "Enviando resumo..." });
+  await bot.answerCallbackQuery(query.id, { text: `Enviando ${label}...` });
 
   try {
-    await bot.sendMessage(TARGET_CHAT, pending.message, {
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-    });
-    pendingResumoMessages.delete(requestId);
+    const messages = pending.messages || [pending.message];
+
+    for (const message of messages) {
+      await bot.sendMessage(TARGET_CHAT, message, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      });
+    }
+
+    pendingMessages.delete(requestId);
     await clearMessageButtons(pending.chatId, pending.messageId);
-    logInfo("Resumo enviado após confirmação", {
-      command: "resumo",
+    logInfo(`${label} enviado apos confirmacao`, {
+      command: type,
       userId: query.from.id,
       username: query.from.username,
       chatId: pending.chatId,
     });
-    await bot.sendMessage(pending.chatId, "Resumo enviado no grupo ✅");
+    await bot.sendMessage(pending.chatId, `${label} enviado no grupo ✅`);
   } catch (error) {
-    logError("Erro ao enviar resumo confirmado", error, {
-      command: "resumo",
+    logError(`Erro ao enviar ${label} confirmado`, error, {
+      command: type,
       userId: query.from.id,
       username: query.from.username,
       chatId: pending.chatId,
     });
     await bot.sendMessage(
       pending.chatId,
-      "Deu erro ao enviar o resumo no grupo. Confira o terminal e as permissões do bot."
+      `Deu erro ao enviar o ${label} no grupo. Confira o terminal e as permissões do bot.`
     );
   }
 });
