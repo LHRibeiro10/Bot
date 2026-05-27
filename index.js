@@ -648,6 +648,235 @@ function buildDailySummaryMessage() {
 `;
 }
 
+function formatPercentBR(value, fractionDigits = 1) {
+  if (!Number.isFinite(value)) {
+    return "0%";
+  }
+
+  const rounded = Number(value.toFixed(fractionDigits));
+  const minimumFractionDigits = Number.isInteger(rounded) ? 0 : fractionDigits;
+
+  return `${rounded.toLocaleString("pt-BR", {
+    minimumFractionDigits,
+    maximumFractionDigits: fractionDigits,
+  })}%`;
+}
+
+function getTimestamp(dateInput) {
+  const timestamp = new Date(dateInput).getTime();
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function formatDateTimeBR(dateInput) {
+  const date = new Date(dateInput);
+
+  if (!Number.isFinite(date.getTime())) {
+    return "data inválida";
+  }
+
+  return new Intl.DateTimeFormat("pt-BR", {
+    timeZone: BOT_TIME_ZONE,
+    day: "2-digit",
+    month: "2-digit",
+    year: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function getEntryStatusLabel(status) {
+  if (status === "green") {
+    return "GREEN";
+  }
+
+  if (status === "red") {
+    return "RED";
+  }
+
+  return "PENDENTE";
+}
+
+function getResultHighlight(result) {
+  if (!result) {
+    return "sem registro";
+  }
+
+  const numberText = result.number ? `${getOrdinalEntrada(result.number)} - ` : "";
+  const resultText = formatCurrencyBRL(Number(result.resultCents) || 0, { signed: true });
+  const dateText = formatDateTimeBR(result.createdAt);
+
+  return `${escapeHtml(numberText)}${escapeHtml(resultText)} (${escapeHtml(dateText)})`;
+}
+
+function buildResultStreaks(results) {
+  let longestGreen = 0;
+  let runningGreen = 0;
+
+  for (const result of results) {
+    if (result.type === "green") {
+      runningGreen += 1;
+      longestGreen = Math.max(longestGreen, runningGreen);
+    } else {
+      runningGreen = 0;
+    }
+  }
+
+  const latest = results[results.length - 1];
+
+  if (!latest) {
+    return {
+      currentType: null,
+      currentCount: 0,
+      longestGreen,
+    };
+  }
+
+  let currentCount = 0;
+
+  for (let index = results.length - 1; index >= 0; index -= 1) {
+    if (results[index].type !== latest.type) {
+      break;
+    }
+
+    currentCount += 1;
+  }
+
+  return {
+    currentType: latest.type,
+    currentCount,
+    longestGreen,
+  };
+}
+
+function buildHistoryStats() {
+  const results = appState.results
+    .filter((result) => result.type === "green" || result.type === "red")
+    .sort((a, b) => {
+      const timestampDiff = getTimestamp(a.createdAt) - getTimestamp(b.createdAt);
+      return timestampDiff || String(a.id || "").localeCompare(String(b.id || ""));
+    });
+
+  const greens = results.filter((result) => result.type === "green").length;
+  const reds = results.filter((result) => result.type === "red").length;
+  const closed = greens + reds;
+  const totalResultCents = results.reduce(
+    (total, result) => total + (Number(result.resultCents) || 0),
+    0
+  );
+  const knownStakeCents = results.reduce((total, result) => {
+    const valueCents = Number(result.valueCents);
+    return Number.isSafeInteger(valueCents) && valueCents > 0 ? total + valueCents : total;
+  }, 0);
+  const pendingEntries = appState.entries.filter((entry) => entry.status === "pending");
+  const closedEntries = appState.entries.filter(
+    (entry) => entry.status === "green" || entry.status === "red"
+  );
+  const bestGreen = results
+    .filter((result) => result.type === "green")
+    .sort((a, b) => (Number(b.resultCents) || 0) - (Number(a.resultCents) || 0))[0];
+  const worstRed = results
+    .filter((result) => result.type === "red")
+    .sort((a, b) => (Number(a.resultCents) || 0) - (Number(b.resultCents) || 0))[0];
+  const streaks = buildResultStreaks(results);
+  const recentEntries = [...appState.entries].sort((a, b) => {
+    const numberDiff = (Number(b.number) || 0) - (Number(a.number) || 0);
+    return numberDiff || getTimestamp(b.createdAt) - getTimestamp(a.createdAt);
+  });
+
+  return {
+    greens,
+    reds,
+    closed,
+    totalEntries: appState.entries.length,
+    closedEntries: closedEntries.length,
+    pendingEntries: pendingEntries.length,
+    manualResults: results.filter((result) => !result.entryId).length,
+    totalResultCents,
+    knownStakeCents,
+    averageResultCents: closed ? Math.round(totalResultCents / closed) : 0,
+    accuracy: closed ? (greens / closed) * 100 : null,
+    roi: knownStakeCents ? (totalResultCents / knownStakeCents) * 100 : null,
+    firstResult: results[0],
+    latestResult: results[results.length - 1],
+    bestGreen,
+    worstRed,
+    streaks,
+    recentEntries,
+  };
+}
+
+function buildRecentEntryLine(entry) {
+  const status = getEntryStatusLabel(entry.status);
+  const valueText = entry.valueText || formatCurrencyBRL(Number(entry.valueCents) || 0);
+  const returnText = entry.returnText || formatCurrencyBRL(Number(entry.returnCents) || 0);
+  const oddText = entry.oddText ? ` | odd ${escapeHtml(entry.oddText)}` : "";
+  const resultCents = Number(entry.resultCents);
+  const resultText = Number.isSafeInteger(resultCents)
+    ? ` | ${escapeHtml(formatCurrencyBRL(resultCents, { signed: true }))}`
+    : "";
+  const dateText = formatDateTimeBR(entry.closedAt || entry.createdAt);
+
+  return `${escapeHtml(getOrdinalEntrada(entry.number))} - <b>${status}</b> - ${escapeHtml(
+    valueText
+  )} -> ${escapeHtml(returnText)}${oddText}${resultText} (${escapeHtml(dateText)})`;
+}
+
+function buildHistoryMessage(limit = 8) {
+  const history = buildHistoryStats();
+  const recentEntries = history.recentEntries.slice(0, limit);
+  const latestEntriesText = recentEntries.length
+    ? recentEntries.map(buildRecentEntryLine).join("\n")
+    : "Nenhuma entrada registrada em /entradafoto.";
+  const accuracyText =
+    history.accuracy === null ? "sem entradas finalizadas" : formatPercentBR(history.accuracy);
+  const roiText = history.roi === null ? "sem base de stake" : formatPercentBR(history.roi);
+  const firstDate = history.firstResult ? formatDateTimeBR(history.firstResult.createdAt) : null;
+  const latestDate = history.latestResult ? formatDateTimeBR(history.latestResult.createdAt) : null;
+  const periodText = firstDate && latestDate ? `${firstDate} até ${latestDate}` : "sem resultados";
+  const manualResultsText = history.manualResults
+    ? `\nResultados manuais: ${history.manualResults}`
+    : "";
+  const currentStreakText = history.streaks.currentType
+    ? `${getEntryStatusLabel(history.streaks.currentType)} x${history.streaks.currentCount}`
+    : "sem sequência";
+  const projectText =
+    appState.projectStartCents === null
+      ? "sem valor inicial"
+      : `${formatCurrencyBRL(appState.projectStartCents)} -> ${formatCurrencyBRL(
+          appState.projectStartCents + history.totalResultCents
+        )}`;
+
+  return `
+<b>Histórico de entradas</b>
+
+Período: <b>${escapeHtml(periodText)}</b>
+Entradas registradas: <b>${history.totalEntries}</b>
+Entradas finalizadas: <b>${history.closedEntries}</b>
+Resultados finalizados: <b>${history.closed}</b>${escapeHtml(manualResultsText)}
+
+Greens: <b>${history.greens}</b>
+Reds: <b>${history.reds}</b>
+Assertividade: <b>${escapeHtml(accuracyText)}</b>
+Pendentes: <b>${history.pendingEntries}</b>
+
+Resultado total: <b>${escapeHtml(formatCurrencyBRL(history.totalResultCents, { signed: true }))}</b>
+Valor em entradas finalizadas: <b>${escapeHtml(formatCurrencyBRL(history.knownStakeCents))}</b>
+ROI: <b>${escapeHtml(roiText)}</b>
+Média por resultado: <b>${escapeHtml(
+    formatCurrencyBRL(history.averageResultCents, { signed: true })
+  )}</b>
+Projeto: <b>${escapeHtml(projectText)}</b>
+
+Melhor green: <b>${getResultHighlight(history.bestGreen)}</b>
+Pior red: <b>${getResultHighlight(history.worstRed)}</b>
+Sequência atual: <b>${escapeHtml(currentStreakText)}</b>
+Maior sequência green: <b>${history.streaks.longestGreen}</b>
+
+<b>Últimas ${recentEntries.length || 0} entradas</b>
+${latestEntriesText}
+`;
+}
+
 function isValidUrl(url) {
   try {
     const parsedUrl = new URL(url);
@@ -734,6 +963,8 @@ Comandos:
 /status - ver se o bot está configurado
 /teste - testar envio
 /resumo - prévia do resumo com confirmação para enviar ao grupo
+
+/historico - histórico completo das entradas
 
 /entrada CAMPEONATO | JOGO | MERCADO | ODD | UNIDADE | LINK
 /entradafoto VALOR_ENTRADA | ODD | LINK
@@ -837,6 +1068,22 @@ bot.onText(/\/resumo/, async (msg) => {
       "Não consegui te mandar o resumo no privado. Abra uma conversa com o bot e envie /start primeiro."
     );
   }
+});
+
+bot.onText(/^\/historico(?:@\w+)?(?:\s+(\d{1,2}))?\s*$/, async (msg, match) => {
+  if (await denyIfNotAdmin(msg, "historico")) {
+    return;
+  }
+
+  refreshStateFromDisk();
+
+  const requestedLimit = match[1] ? Number(match[1]) : 8;
+  const limit = Math.min(Math.max(requestedLimit, 1), 20);
+
+  await bot.sendMessage(msg.chat.id, buildHistoryMessage(limit), {
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+  });
 });
 
 bot.on("callback_query", async (query) => {
